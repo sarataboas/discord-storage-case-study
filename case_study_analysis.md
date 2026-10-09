@@ -2,6 +2,8 @@
 
 #### January 13, 2017
 
+----
+
 ### **Introduction**
 
 - Discord grows faster and so does the user-generated context: 
@@ -12,6 +14,8 @@
 - Early decision made by Discord: Store all chat history forever
     - Data increases in velocity, size and must remain available -> Solution : **Cassandra**
 
+
+----
 
 ### **What we were doing**
 
@@ -113,6 +117,7 @@ Before choosing the new database, Discord tried to understand the read/write pat
 > - Backed by DataStax
 
 
+----
 
 ### **Data Modeling**
 
