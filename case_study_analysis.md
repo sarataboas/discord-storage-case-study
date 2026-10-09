@@ -121,3 +121,124 @@ Before choosing the new database, Discord tried to understand the read/write pat
 
 ### **Data Modeling**
 
+**Cassadra** -> **KKV store**: 
+- Two K's comprise the primary key: 
+    - First K: **Partition Key** -> used to determine which node the data lives on and where it is found on disk
+
+        - Partition contains multiple rows within it; 
+        - A row within the partition is identified by the second K
+    
+    - Second K: **Clustering Key** -> identifies each row within a partition and determines the order in which the rows are stored
+
+
+
+Remembering previous model: 
+
+- Messages were indexed in MongoDB using `channel_id` and `created_at`. 
+
+- `channel_id` -> became the **partition key** -> messages from the same channel are stored in the same partition - *why?* because queries usually search for messages within a specific channel
+
+- `created_at` as clustering key? -> No, two messages can have the same creation time
+    - every ID on Discord is a Snowflake (=chronologically sorted) -> `message_id` became the **clustering key**
+        - each message has a unique ID (Snowflake) which contains time information and allows messages to be ordered chronologically
+
+
+**primary key** -> **(channel_id, message_id)** -> `channel_id` tells Cassandra where the messages are stored, while `message_id` identifies and orders messages within that channel
+
+
+#### Example of a simplified schema for the messages table
+
+```sql
+CREATE TABLE messages ( 
+    channel_id bigint,
+    message_id bigint,
+    author_id bigint,
+    content text,
+    PRIMARY KEY (chanel_id, message_id)
+) with CLUSTERING ORDER BY (message_id DESC);
+```
+
+
+- Cassandra has schemas (that defines the data structure and columns of the tables, and like relational db), however: 
+
+    - they are cheap to alter 
+    - do not impose temporary performance impact
+
+
+
+**Problem in the process:**
+- Cassandra can support partitions up to 2GB, but that does not mean that having very large partitions is a good idea
+
+- When Discord started importing existing messages into Cassandra, it received warnings because some partitions were already larger than 100MB
+
+- ***Why are large partitions a problem?***
+
+    - **More memory pressure:** large partitions put more pressure on Cassandra's garbage collector (GC)
+
+    - **Harder to distribute data:** a partition is stored on a particular part of the cluster, so Cassandra cannot split a single partition across multiple nodes
+
+    - **Continuous growth:** a Discord channel can exist for years, meaning its partition could keep growing as new messages are added
+
+- Discord realised that it needed to **limit the size of each partition** to avoid performance problems as channels continued to grow
+
+
+**Decision:** Bucket the messages by time
+
+- They looked at the largest channels and determined if they stored about 10 days of messages within a bucket that they could comfortably stay under 100MB
+
+- Buckets had to be derivable from the `message_id` or a `timestamp`
+
+```python
+DISCORD_EPOCH = 1420070400000
+BUCKET_SIZE = 1000 * 60 * 60 * 24 * 10
+
+
+def make_bucket(snowflake):
+   if snowflake is None:
+       timestamp = int(time.time() * 1000) - DISCORD_EPOCH
+   else:
+       # When a Snowflake is created it contains the number of
+       # seconds since the DISCORD_EPOCH.
+       timestamp = snowflake_id >> 22
+   return int(timestamp / BUCKET_SIZE)
+  
+  
+def make_buckets(start_id, end_id=None):
+   return range(make_bucket(start_id), make_bucket(end_id) + 1)
+view raw
+```
+
+
+- Cassandra partition keys can be compounded, so the new primary key became **((channel_id, bucket), message_id)**
+
+```sql
+CREATE TABLE messages ( 
+    channel_id bigint,
+    bucket int,
+    message_id bigint,
+    author_id bigint,
+    content text,
+    PRIMARY KEY ((channel_id, bucket), message_id),
+) WITH CLUSTERING ORDER BY (message_id DESC);
+```
+
+- To query for recent messages in the channel, they generate a bucket range from current time to `channel_id`
+
+- Then, they sequentially query partitions until enough messages are collected
+
+    - **Downside:** rarely active Discords will have to query multiple buckets to collect enough messages over time
+
+        - In practice -> this has proved to be fine because for active Discords enough messages are usually found in the first partition and they are the majority
+
+----
+
+### **Dark Launch**
+
+- Setup the code to double read/write to MongoDB and Cassandra before introducing the new system into production
+
+- Got an unexpected bug -> `author_id` was null, which was impossible, because this is a required field
+
+----
+
+### **Eventual Consistency**
+
